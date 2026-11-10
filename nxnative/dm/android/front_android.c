@@ -201,15 +201,20 @@ JNIEXPORT void JNICALL Java_org_nx2a_ExternalActivity_externalInput(JNIEnv *env,
     if (g_ilooper) ALooper_wake(g_ilooper);
 }
 static uint64_t g_btn; static float g_ax[8]; static int g_pad_used;   // lx ly rx ry lt rt hatx haty
-static int pad_xbox(void) {   // DM_PAD_XBOX=1 in env.txt: a physical controller's face buttons by their label (an Xbox controller's A is the game's A) instead of by their position:
-    static int on = -1;         // the game's own prompts name the button (A to confirm, B to go back), which an Xbox controller's labels match and its positions do not. Only a
-                              // controller is remapped: the on-screen gamepad sends the game's buttons as they are (the Switch layout, with A, B, X and Y on the buttons, as the prompts name them)
-    if (on < 0) { const char *e = getenv("DM_PAD_XBOX"); on = e && atoi(e) ? 1 : 0; }
+static int pad_xbox(void) {   // DM_PAD_XBOX in env.txt: a physical controller's face buttons by their label (an Xbox controller's A is the game's A) instead of by their position.
+    static int on = -1;         // The game's own prompts name the button (A to confirm, B to go back), which an Xbox controller's labels match and its positions do not.
+                                // 1: all four by label. ab: A and B by label, so the bottom button confirms and the right one goes back, while X and Y keep their
+                                // places (the top button is the game's X, the left one its Y), which the porter's Xbox button icons show as Y and X (porter config
+                                // pad_layout xbox). Only a controller is remapped: the on-screen gamepad sends the game's buttons as they are (the Switch layout,
+                                // with A, B, X and Y on the buttons, as the prompts name them)
+    if (on < 0) { const char *e = getenv("DM_PAD_XBOX"); on = !e ? 0 : !strcmp(e, "ab") ? 2 : atoi(e) ? 1 : 0; }
     return on;
 }
 static uint64_t key_bit(int32_t k) {   // Nintendo layout by position: the bottom face button is B, the right one A (as the iOS front end maps)
-    if (pad_xbox()) switch (k) {   // by label instead: A is A, B is B, X is X, Y is Y (the pause menu and the text entry follow it: A confirms, B erases)
-    case AKEYCODE_BUTTON_A: return DM_BTN_A; case AKEYCODE_BUTTON_B: return DM_BTN_B; case AKEYCODE_BUTTON_X: return DM_BTN_X; case AKEYCODE_BUTTON_Y: return DM_BTN_Y;
+    if (pad_xbox()) switch (k) {   // by label instead: A is A, B is B (the pause menu and the text entry follow it: A confirms, B erases), and with 1 X is X, Y is Y
+    case AKEYCODE_BUTTON_A: return DM_BTN_A; case AKEYCODE_BUTTON_B: return DM_BTN_B;
+    case AKEYCODE_BUTTON_X: if (pad_xbox() == 1) return DM_BTN_X; break;
+    case AKEYCODE_BUTTON_Y: if (pad_xbox() == 1) return DM_BTN_Y; break;
     default: break;
     }
     switch (k) {
@@ -236,7 +241,8 @@ static _Atomic int g_knob[2][2];    // the sticks' knob offsets, in 1/10000 of t
 static _Atomic int64_t g_press_t[16], g_menu_t, g_stick_t[2];   // when each overlay button (by DM_BTN_* bit), the menu button and each stick went down, 0 = not held
 static uint64_t g_touch_btn;        // the overlay buttons held, as of the last touch event
 static int64_t mono_ns(void) { struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts); return (int64_t)ts.tv_sec * 1000000000 + ts.tv_nsec; }
-int dm_overlay_visible(void) { return atomic_load(&g_pads) ? 0 : atomic_load(&g_set_overlay) && atomic_load(&g_overlay) ? 1 : 2; }
+static _Atomic int g_pads_wait;     // DM_PAD_ATTACHED=hide: 1 until pad_watch has looked for controllers once, so the gamepad does not show for a moment at start-up
+int dm_overlay_visible(void) { return atomic_load(&g_pads) || atomic_load(&g_pads_wait) ? 0 : atomic_load(&g_set_overlay) && atomic_load(&g_overlay) ? 1 : 2; }
 int dm_overlay_layout(void) {   // the phone's layout in a window at least OV_PHONE_ASPECT wide for its height (overlay_layout.h)
     static int last_w = -1, last_h = -1, phone;
     ANativeWindow *w = phone_window(); int ww = w ? ANativeWindow_getWidth(w) : 0, wh = w ? ANativeWindow_getHeight(w) : 0;
@@ -329,7 +335,9 @@ static void menu_drag(const ov_ctl *m, float x, float y, float W, float H) {   /
 // when it is a gamepad or a joystick and not virtual (the tablet's own keys, touch screen and pen are neither), and once it has sent input: Xiaomi phones
 // keep a system device "uinput-xiaomi" attached for good that says it is a gamepad and sends nothing, which hid the gamepad and its menu button (issue #22).
 // While one is attached nothing of the gamepad is shown and every touch is the game's; its keys open the menu (Back, Mode, Menu: handle_event). When the
-// last one goes, the gamepad comes back ----
+// last one goes, the gamepad comes back. DM_PAD_ATTACHED=hide (porter config hide_touch_controls): the gamepad starts hidden and a controller counts as soon as
+// it is attached, so the gamepad shows only when the first look finds none, and never on a handheld with its own controls (the Odin 2 Portal's says it is an Xbox Wireless Controller); a phone with such a silent system
+// device then shows no gamepad either, which is why it is not the default ----
 static int jx(JNIEnv *E) { if (!(*E)->ExceptionCheck(E)) return 0; (*E)->ExceptionClear(E); return 1; }
 static void *pad_watch(void *a) {
     JavaVM *vm = a; JNIEnv *E; pthread_setname_np(pthread_self(), "padwatch");
@@ -339,8 +347,8 @@ static void *pad_watch(void *a) {
     jmethodID mSrc = cID ? (*E)->GetMethodID(E, cID, "getSources", "()I") : NULL, mVirt = cID ? (*E)->GetMethodID(E, cID, "isVirtual", "()Z") : NULL;
     jmethodID mName = cID ? (*E)->GetMethodID(E, cID, "getName", "()Ljava/lang/String;") : NULL;
     jmethodID mVen = cID ? (*E)->GetMethodID(E, cID, "getVendorId", "()I") : NULL, mProd = cID ? (*E)->GetMethodID(E, cID, "getProductId", "()I") : NULL;
-    if (jx(E) || !mIds || !mGet || !mSrc || !mVirt || !mName || !mVen || !mProd) { LOG("[RED] [input] InputDevice methods missing: attached controllers are not watched"); return NULL; }
-    int prev[16], used[16], np = 0;
+    if (jx(E) || !mIds || !mGet || !mSrc || !mVirt || !mName || !mVen || !mProd) { LOG("[RED] [input] InputDevice methods missing: attached controllers are not watched"); atomic_store(&g_pads_wait, 0); return NULL; }
+    int prev[16], used[16], np = 0; const char *ha = getenv("DM_PAD_ATTACHED"); int on_sight = ha && !strcmp(ha, "hide");
     for (;;) {
         int ids[16], on[16], n = 0, nu = 0, in = atomic_load(&g_pad_in);
         jintArray arr = (*E)->CallStaticObjectMethod(E, cID, mIds);
@@ -351,11 +359,11 @@ static void *pad_watch(void *a) {
                 jint src = (*E)->CallIntMethod(E, d, mSrc); jboolean virt = (*E)->CallBooleanMethod(E, d, mVirt);
                 if (!jx(E) && !virt && ((src & AINPUT_SOURCE_GAMEPAD) == AINPUT_SOURCE_GAMEPAD || (src & AINPUT_SOURCE_JOYSTICK) == AINPUT_SOURCE_JOYSTICK)) {
                     int known = 0, was = 0; for (int k = 0; k < np; k++) if (prev[k] == v[i]) { known = 1; was = used[k]; }
-                    ids[n] = v[i]; on[n] = was || v[i] == in; nu += on[n];
+                    ids[n] = v[i]; on[n] = was || v[i] == in || on_sight; nu += on[n];
                     if (!known) {
                         jstring s = (*E)->CallObjectMethod(E, d, mName); const char *nm = !jx(E) && s ? (*E)->GetStringUTFChars(E, s, NULL) : NULL;
                         jint ven = (*E)->CallIntMethod(E, d, mVen), prod = (*E)->CallIntMethod(E, d, mProd); jx(E);
-                        LOG("[input] controller attached: %s (device %d, sources 0x%x, %04x:%04x): the gamepad is hidden once it is used", nm ? nm : "?", v[i], src, ven, prod);
+                        LOG("[input] controller attached: %s (device %d, sources 0x%x, %04x:%04x): the gamepad is hidden %s", nm ? nm : "?", v[i], src, ven, prod, on_sight ? "while it is attached" : "once it is used");
                         if (nm) (*E)->ReleaseStringUTFChars(E, s, nm);
                         if (s) (*E)->DeleteLocalRef(E, s);
                     }
@@ -368,10 +376,12 @@ static void *pad_watch(void *a) {
             (*E)->DeleteLocalRef(E, arr);
         }
         for (int k = 0; k < np; k++) { int still = 0; for (int i = 0; i < n; i++) still |= ids[i] == prev[k]; if (!still) LOG("[input] controller detached (device %d)", prev[k]); }
+        int first = atomic_exchange(&g_pads_wait, 0);
         if (atomic_exchange(&g_pads, nu) && !nu) {   // the last one went: the gamepad again, and the device's motor for rumble
             atomic_store(&g_overlay, 1); dm_haptics_android_device(-1);
             LOG("[input] no controller in use: the gamepad is shown");
         }
+        if (first && !nu) LOG("[input] no controller attached: the gamepad is shown");
         memcpy(prev, ids, sizeof ids); memcpy(used, on, sizeof on); np = n;
         sleep(1);
     }
@@ -838,6 +848,9 @@ int front_text_input(const char *title, const char *sub, const char *guide, cons
 }
 
 __attribute__((weak)) void dm_picture_rect(float r[4]);   // gfx_vk_present.c
+// DM_TOUCH_ATTACHED=ignore (opt-in, env.txt): while a controller is attached, touches don't reach the game's touch screen. A Switch game that reads
+// touch gestures acts on them (South Park: The Fractured But Whole attacks on a tap), and a player holding a controller touches the screen by accident
+static int touch_ignored(void) { static int on = -1; if (on < 0) { const char *e = getenv("DM_TOUCH_ATTACHED"); on = e && !strcmp(e, "ignore"); } return on; }
 static void touch_event(AInputEvent *e) {
     ANativeWindow *w = phone_window(); float W = w ? (float)ANativeWindow_getWidth(w) : 1, H = w ? (float)ANativeWindow_getHeight(w) : 1;
     if (atomic_load(&g_tx_on)) { tx_touch(e, W, H); return; }   // the text entry's keys
@@ -868,6 +881,7 @@ static void touch_event(AInputEvent *e) {
             }
             g_ptr_ctl[id] = 0; continue;
         }
+        if (c < 0 && atomic_load(&g_pads) && touch_ignored()) continue;   // DM_TOUCH_ATTACHED=ignore: a controller is attached, the screen is not the game's
         if (c < 0) { if (n < 16) { t[n].id = (uint32_t)id & 15; t[n].x = (x / W - pic[0]) / pic[2]; t[n].y = (y / H - pic[1]) / pic[3]; n++; } continue; }   // relative to the game's picture
         const ov_ctl *k = &OV_CTLS[c];
         if (k->kind == OV_MENU) { if (id == g_drag.id) menu_drag(k, x, y, W, H); continue; }
@@ -1170,7 +1184,9 @@ __attribute__((visibility("default"))) void ANativeActivity_onCreate(ANativeActi
     if (dm_saves_start(g_root)) { LOG("[saves] the request asked the app to end: the game is not started"); g_quit = 1; return; }
     if (!romfs_readable(act, sdk)) { g_quit = 1; return; }   // after the save manager's requests, which need no RomFS
     settings_load(); dm_haptics_android_start(act, atomic_load(&g_set_rumble)); dm_lan_android_start(act);
-    { pthread_t w; if (!pthread_create(&w, NULL, pad_watch, act->vm)) pthread_detach(w); }
+    { const char *ha = getenv("DM_PAD_ATTACHED"); pthread_t w;
+      if (ha && !strcmp(ha, "hide")) atomic_store(&g_pads_wait, 1);
+      if (!pthread_create(&w, NULL, pad_watch, act->vm)) pthread_detach(w); else atomic_store(&g_pads_wait, 0); }
     { pthread_t w; if (!pthread_create(&w, NULL, temp_watch, act->vm)) pthread_detach(w); }
     LOG("NX2A host on Android: files %s, RomFS %s, saves %s", g_root, getenv("DM_ROMFS"), act->internalDataPath);
     pthread_t t; pthread_create(&t, NULL, input_thread, NULL); pthread_detach(t);
