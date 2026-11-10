@@ -1,0 +1,15 @@
+# South Park: The Fractured But Whole on Android (keys in docs/ARCHITECTURE.md "Game profiles on Android")
+# Tested 2026-11-09 on the Odin 2 Portal (Snapdragon 8 Gen 2, Adreno 740), driven with the on-screen gamepad: the logos, the title, the main menu,
+# New Game, the opening cutscenes, character creation and difficulty, the town opening and the first minigame (the toilet, with its HUD and button
+# prompts) draw right at a steady 30 fps (frame time p50 33.3 ms), with sound: 15 minutes of 6-channel output mixed to stereo, no underruns, no red
+# log lines. Not played past the first minigame. Buttons held under a frame (an instant tap) can be missed at 30 fps; held for 200 ms they always land.
+# The interface quads come from a buffer texture whose handle sits in the game's own constant buffer; the core binds such buffers as rows of a 2D image
+# (vk_tbuf_rows_view), without which every screen stayed black.
+status	wip
+tested	v327680 Odin 2 Portal (Snapdragon 8 Gen 2, Adreno 740)
+package	org.nx2a.southparkfbw
+orientation	landscape
+# Snowdrop keeps one thread yielding about 34,000 times a second from start-up through the title and the opening (thread 0x1010, sdk+0xa2f578): normal for
+# this engine, not a hang. At the default threshold (12,000) the yield watchdog fired about 30 s in, and its thread dump paused every thread for seconds:
+# the audio device stopped calling back and the game stalled, every time
+env	DM_YIELD_WATCH=60000
